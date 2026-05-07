@@ -305,7 +305,13 @@ pub fn scan_mcp_servers(adapter: &dyn AgentAdapter) -> Vec<Extension> {
                 tags: vec![],
                 pack,
                 permissions,
-                enabled: true,
+                // Reflect the agent's own enabled state. For 7 of 8 adapters
+                // this is always true (their formats lack a disable concept);
+                // only OpenCode's schema can produce a false here, surfacing
+                // user-disabled-in-config entries as visible-but-disabled
+                // rather than hiding them. HarnessKit's separate UI-toggled
+                // disable flow operates orthogonally via SQLite tracking.
+                enabled: server.enabled,
                 trust_score: None,
                 installed_at: config_created,
                 updated_at: config_modified,
@@ -426,7 +432,10 @@ pub fn scan_plugins(adapter: &dyn AgentAdapter) -> Vec<Extension> {
                 installed_at,
                 updated_at,
 
-                source_path: None,
+                source_path: plugin
+                    .path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
                 cli_parent_id: None,
                 cli_meta: None,
                 install_meta: None,
@@ -924,7 +933,9 @@ pub fn scan_project_extensions(
                     tags: vec![],
                     pack: None,
                     permissions,
-                    enabled: true,
+                    // Reflect the agent's enabled state — see global-scope
+                    // counterpart above for the cross-adapter invariant.
+                    enabled: server.enabled,
                     trust_score: None,
                     installed_at: config_created,
                     updated_at: config_modified,
@@ -1264,6 +1275,21 @@ pub fn discover_projects(root: &Path, max_depth: usize) -> Vec<DiscoveredProject
     projects
 }
 
+/// True if `dir` looks like a project root for any of the supported agents.
+/// Each adapter declares its own `project_markers` (see
+/// [`adapter::AgentAdapter::project_markers`]); we consider the directory a
+/// project as soon as one adapter's marker matches. Used by both project
+/// discovery (`discover_projects`) and the `add_project` validation in
+/// hk-desktop / hk-web.
+pub fn is_project_dir(dir: &Path) -> bool {
+    crate::adapter::all_adapters().iter().any(|a| {
+        a.project_markers().iter().any(|m| match m {
+            crate::adapter::ProjectMarker::Dir(p) => dir.join(p).is_dir(),
+            crate::adapter::ProjectMarker::File(p) => dir.join(p).is_file(),
+        })
+    })
+}
+
 fn discover_projects_recursive(
     dir: &Path,
     max_depth: usize,
@@ -1274,30 +1300,7 @@ fn discover_projects_recursive(
         return;
     }
 
-    // Check if this directory is a project (any agent's config present)
-    let is_project =
-        // Claude Code: .claude/ directory
-        dir.join(".claude").is_dir()
-        // Claude Code: .mcp.json
-        || dir.join(".mcp.json").is_file()
-        // Codex: .codex/ directory
-        || dir.join(".codex").is_dir()
-        // Gemini: .gemini/ directory
-        || dir.join(".gemini").is_dir()
-        // Cursor: .cursor/rules/ directory or .cursorrules file
-        || dir.join(".cursor").join("rules").is_dir()
-        || dir.join(".cursorrules").is_file()
-        // Copilot: .github/copilot-instructions.md or .github/instructions/
-        || dir.join(".github").join("copilot-instructions.md").is_file()
-        || dir.join(".github").join("instructions").is_dir()
-        // Antigravity: .agent/rules/ or .agent/skills/
-        || dir.join(".agent").join("rules").is_dir()
-        || dir.join(".agent").join("skills").is_dir()
-        // Windsurf: .windsurf/ directory or .windsurfrules file
-        || dir.join(".windsurf").is_dir()
-        || dir.join(".windsurfrules").is_file();
-
-    if is_project {
+    if is_project_dir(dir) {
         let name = dir
             .file_name()
             .unwrap_or_default()
@@ -1687,28 +1690,52 @@ fn infer_hook_permissions(command: &str) -> Vec<Permission> {
     permissions
 }
 
-/// Infer permissions from plugin directory contents.
-/// Reads JS/TS/Python/JSON files and applies pattern matching.
-fn infer_plugin_permissions(dir: &Path) -> Vec<Permission> {
+fn plugin_code_extension(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_string_lossy();
+    let base = file_name.strip_suffix(".disabled").unwrap_or(&file_name);
+    Path::new(base)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_string())
+}
+
+/// Infer permissions from plugin source contents.
+/// Supports both directory-based plugins and single-file plugins.
+fn infer_plugin_permissions(path: &Path) -> Vec<Permission> {
     let allowed_extensions = ["js", "ts", "py", "json", "sh", "mjs", "cjs"];
     let max_total_bytes: usize = 256 * 1024;
     let mut total_bytes = 0usize;
     let mut combined_content = String::new();
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let mut candidate_files = Vec::new();
+    if path.is_file() {
+        if let Some(ext) = plugin_code_extension(path)
+            && allowed_extensions.contains(&ext.as_str())
+        {
+            candidate_files.push(path.to_path_buf());
+        }
+    } else if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let file = entry.path();
+            if !file.is_file() {
+                continue;
+            }
+            let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if allowed_extensions.contains(&ext) {
+                candidate_files.push(file);
+            }
+        }
+    } else {
         return vec![
             Permission::Shell { commands: vec![] },
             Permission::FileSystem { paths: vec![] },
         ];
-    };
+    }
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() { continue; }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !allowed_extensions.contains(&ext) { continue; }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if total_bytes + content.len() > max_total_bytes { break; }
+    for file in candidate_files {
+        if let Ok(content) = std::fs::read_to_string(&file) {
+            if total_bytes + content.len() > max_total_bytes {
+                break;
+            }
             total_bytes += content.len();
             combined_content.push_str(&content);
             combined_content.push('\n');
@@ -1726,7 +1753,12 @@ fn infer_plugin_permissions(dir: &Path) -> Vec<Permission> {
     let mut perms = infer_skill_permissions(&combined_content);
 
     // Also check package.json for lifecycle scripts
-    let pkg_path = dir.join("package.json");
+    let pkg_parent = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let pkg_path = pkg_parent.join("package.json");
     if let Ok(pkg_content) = std::fs::read_to_string(&pkg_path)
         && let Ok(json) = serde_json::from_str::<serde_json::Value>(&pkg_content)
         && let Some(scripts) = json.get("scripts").and_then(|s| s.as_object())
@@ -2159,6 +2191,20 @@ mod tests {
         std::fs::create_dir_all(&proj7).unwrap();
         std::fs::write(proj7.join(".windsurfrules"), "Follow repo rules").unwrap();
 
+        // Project with .opencode/ (OpenCode)
+        let proj8 = root.path().join("project-h");
+        std::fs::create_dir_all(proj8.join(".opencode").join("skills")).unwrap();
+
+        // Project with opencode.json (OpenCode)
+        let proj9 = root.path().join("project-i");
+        std::fs::create_dir_all(&proj9).unwrap();
+        std::fs::write(proj9.join("opencode.json"), r#"{"mcp":{}}"#).unwrap();
+
+        // Project with opencode.jsonc (OpenCode JSONC variant)
+        let proj10 = root.path().join("project-j");
+        std::fs::create_dir_all(&proj10).unwrap();
+        std::fs::write(proj10.join("opencode.jsonc"), "// jsonc\n{}").unwrap();
+
         // Not a project
         let non_proj = root.path().join("not-a-project");
         std::fs::create_dir_all(&non_proj).unwrap();
@@ -2168,7 +2214,7 @@ mod tests {
         std::fs::create_dir_all(github_only.join(".github")).unwrap();
 
         let discovered = discover_projects(root.path(), 4);
-        assert_eq!(discovered.len(), 7);
+        assert_eq!(discovered.len(), 10);
         let names: Vec<&str> = discovered.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"project-a"));
         assert!(names.contains(&"project-b"));
@@ -2177,7 +2223,28 @@ mod tests {
         assert!(names.contains(&"project-e"));
         assert!(names.contains(&"project-f"));
         assert!(names.contains(&"project-g"));
+        assert!(names.contains(&"project-h"));
+        assert!(names.contains(&"project-i"));
+        assert!(names.contains(&"project-j"));
         assert!(!names.contains(&"github-repo"));
+    }
+
+    #[test]
+    fn test_every_active_adapter_declares_project_markers() {
+        // Regression guard: any agent that participates in `discover_projects`
+        // must declare project_markers(). If a future adapter forgets to
+        // override the trait default (returning empty), this test fails so
+        // we don't silently drop a whole agent from project recognition.
+        // adapters with no on-disk project convention can be added to the
+        // exception list explicitly.
+        let adapters = crate::adapter::all_adapters();
+        for a in &adapters {
+            assert!(
+                !a.project_markers().is_empty(),
+                "{} must declare at least one project_marker",
+                a.name()
+            );
+        }
     }
 
     #[test]
@@ -2625,6 +2692,18 @@ mod config_tests {
         // Should fallback to empty Shell + FileSystem
         assert!(perms.iter().any(|p| matches!(p, Permission::Shell { .. })));
         assert!(perms.iter().any(|p| matches!(p, Permission::FileSystem { .. })));
+    }
+
+    #[test]
+    fn test_plugin_permission_from_single_file_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin = tmp.path().join("plugin.ts");
+        std::fs::write(&plugin, "fetch('https://example.com');").unwrap();
+        let perms = infer_plugin_permissions(&plugin);
+        assert!(
+            perms.iter().any(|p| matches!(p, Permission::Network { domains } if domains.iter().any(|domain| domain == "example.com"))),
+            "Should detect network access from a file-based plugin"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod gemini;
 pub mod hook_events;
+pub mod opencode;
 pub mod windsurf;
 
 use crate::models::ConfigScope;
@@ -17,6 +18,12 @@ pub struct McpServerEntry {
     pub command: String,
     pub args: Vec<String>,
     pub env: std::collections::HashMap<String, String>,
+    /// Whether the agent itself considers this entry active. Currently only
+    /// OpenCode's schema has a per-entry `"enabled"` boolean; every other
+    /// adapter always sets this to `true` because their formats have no
+    /// agent-native disable concept. HarnessKit's own user-toggled disable
+    /// flow tracks state separately in SQLite — this field is orthogonal.
+    pub enabled: bool,
 }
 
 /// Represents a hook entry parsed from an agent's config
@@ -58,6 +65,19 @@ pub enum HookFormat {
     None,
 }
 
+/// A path marker that, when present in a project root directory, identifies
+/// the directory as belonging to a particular agent. Each adapter declares
+/// its own markers via [`AgentAdapter::project_markers`]; project discovery
+/// (`is_project_dir`, `discover_projects`) considers a directory a project
+/// when *any* adapter's marker matches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProjectMarker {
+    /// A relative directory that must exist (e.g. `.claude`, `.opencode`).
+    Dir(&'static str),
+    /// A relative file that must exist (e.g. `.mcp.json`, `opencode.json`).
+    File(&'static str),
+}
+
 /// Format used by an agent for MCP server configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum McpFormat {
@@ -67,6 +87,13 @@ pub enum McpFormat {
     Servers,
     /// TOML with [mcp_servers.<name>] sections (Codex)
     Toml,
+    /// JSON with "mcp" top-level key (OpenCode). Each entry is a tagged
+    /// union — local servers use `{type: "local", command: [bin, ...args],
+    /// environment: {...}}`, distinct from the Claude-style `{command, args, env}`
+    /// schema. `additionalProperties: false` in the upstream schema means no
+    /// extra fields may be written.
+    /// See https://opencode.ai/config.json (McpLocalConfig).
+    Opencode,
 }
 
 pub trait AgentAdapter: Send + Sync {
@@ -180,6 +207,15 @@ pub trait AgentAdapter: Send + Sync {
     // Default empty/None means the agent has no project-level support and the
     // scanner skips it.
 
+    /// Path markers (relative to a project root) that identify a directory as
+    /// belonging to this agent. Used by `is_project_dir` / `discover_projects`
+    /// to decide whether a folder qualifies as a project for *any* agent.
+    /// Default empty means this adapter never claims any directory as its
+    /// project — only override if the agent has a stable on-disk convention.
+    fn project_markers(&self) -> Vec<ProjectMarker> {
+        vec![]
+    }
+
     /// Relative dir patterns within a project that contain skill subdirectories
     /// (e.g. `.claude/skills` for Claude — each subdirectory inside is one skill).
     fn project_skill_dirs(&self) -> Vec<String> {
@@ -253,6 +289,7 @@ pub fn all_adapters() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(antigravity::AntigravityAdapter::new()),
         Box::new(copilot::CopilotAdapter::new()),
         Box::new(windsurf::WindsurfAdapter::new()),
+        Box::new(opencode::OpencodeAdapter::new()),
     ]
 }
 
@@ -261,9 +298,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_adapters_returns_seven() {
+    fn test_all_adapters_returns_eight() {
         let adapters = all_adapters();
-        assert_eq!(adapters.len(), 7);
+        assert_eq!(adapters.len(), 8);
         let names: Vec<&str> = adapters.iter().map(|a| a.name()).collect();
         assert!(names.contains(&"claude"));
         assert!(names.contains(&"cursor"));
@@ -272,6 +309,7 @@ mod tests {
         assert!(names.contains(&"antigravity"));
         assert!(names.contains(&"copilot"));
         assert!(names.contains(&"windsurf"));
+        assert!(names.contains(&"opencode"));
     }
 
     #[test]
@@ -291,7 +329,7 @@ mod tests {
         // setups). Adding an agent here without a confirmed PATH bug would
         // unnecessarily rewrite users' mcp_config.json with absolute paths,
         // hurting cross-machine portability.
-        for name in ["claude", "codex", "gemini", "cursor", "copilot"] {
+        for name in ["claude", "codex", "gemini", "cursor", "copilot", "opencode"] {
             assert!(
                 !by_name[name].needs_path_injection(),
                 "{name} should not need path injection"
@@ -382,6 +420,7 @@ mod tests {
             ("gemini", ".gemini/skills"),
             ("antigravity", ".agent/skills"), // Singular — Antigravity convention
             ("copilot", ".github/skills"),
+            ("opencode", ".opencode/skills"),
         ]
         .into_iter()
         .collect();

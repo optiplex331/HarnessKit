@@ -5,6 +5,12 @@ use crate::{adapter, deployer, sanitize, scanner};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Field names under which an MCP server entry stores its environment-variable
+/// block. Most agents use `"env"`; OpenCode's schema names the same block
+/// `"environment"`. Centralized so secret-handling code (redaction, restore
+/// warnings) stays format-agnostic.
+const MCP_ENV_KEYS: [&str; 2] = ["env", "environment"];
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct InstallResult {
     pub name: String,
@@ -202,7 +208,10 @@ fn toggle_mcp(ext: &Extension, enabled: bool, store: &Store, adapters: &[Box<dyn
             // the user needs to manually set the real values in the config.
             // PATH is excluded: it is auto-injected, not a secret, and is
             // self-healed above for antigravity.
-            if let Some(env_obj) = entry.get("env").and_then(|v| v.as_object()) {
+            for env_key in MCP_ENV_KEYS {
+                let Some(env_obj) = entry.get(env_key).and_then(|v| v.as_object()) else {
+                    continue;
+                };
                 let redacted_keys: Vec<&str> = env_obj
                     .iter()
                     .filter(|(k, v)| k.as_str() != "PATH" && v.as_str() == Some("<redacted>"))
@@ -216,6 +225,7 @@ fn toggle_mcp(ext: &Extension, enabled: bool, store: &Store, adapters: &[Box<dyn
                         redacted_keys.join(", ")
                     );
                 }
+                break; // each entry has at most one env block — stop on first hit
             }
             deployer::restore_mcp_server(&config_path, &ext.name, &entry, format)?;
             store.set_disabled_config(&ext.id, None)?;
@@ -235,9 +245,14 @@ fn toggle_mcp(ext: &Extension, enabled: bool, store: &Store, adapters: &[Box<dyn
 }
 
 /// Redact environment variable values in an MCP server config entry.
-/// Replaces all values in the "env" object with "<redacted>" while preserving keys.
-/// This prevents secrets (API keys, tokens, etc.) from being stored in the
-/// harnesskit SQLite database when an MCP server is disabled.
+/// Replaces all values inside the env-block object with "<redacted>" while
+/// preserving keys. This prevents secrets (API keys, tokens, etc.) from being
+/// stored in the harnesskit SQLite database when an MCP server is disabled.
+///
+/// Two block names are handled: most agents use `"env"`, while OpenCode's
+/// schema names the same block `"environment"`. Only one will be present per
+/// entry, so iterating both keeps this helper format-agnostic without needing
+/// to thread `McpFormat` through every caller.
 ///
 /// `PATH` is excluded — HarnessKit auto-injects it for agents whose
 /// `needs_path_injection()` returns true (see install.rs). It is an operational
@@ -245,12 +260,14 @@ fn toggle_mcp(ext: &Extension, enabled: bool, store: &Store, adapters: &[Box<dyn
 /// can find its binary again.
 fn redact_mcp_env(entry: &serde_json::Value) -> serde_json::Value {
     let mut redacted = entry.clone();
-    if let Some(env_obj) = redacted.get_mut("env").and_then(|v| v.as_object_mut()) {
-        for (key, value) in env_obj.iter_mut() {
-            if key == "PATH" {
-                continue;
+    for env_key in MCP_ENV_KEYS {
+        if let Some(env_obj) = redacted.get_mut(env_key).and_then(|v| v.as_object_mut()) {
+            for (key, value) in env_obj.iter_mut() {
+                if key == "PATH" {
+                    continue;
+                }
+                *value = serde_json::Value::String("<redacted>".into());
             }
-            *value = serde_json::Value::String("<redacted>".into());
         }
     }
     redacted
@@ -304,6 +321,39 @@ fn plugin_key_from_ext(ext: &Extension) -> String {
     } else {
         format!("{}@{}", ext.name, source)
     }
+}
+
+fn plugin_toggle_target(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+
+    [
+        "plugin.json",
+        ".cursor-plugin/plugin.json",
+        ".codex-plugin/plugin.json",
+        ".plugin/plugin.json",
+        ".github/plugin/plugin.json",
+    ]
+    .iter()
+    .map(|manifest_name| path.join(manifest_name))
+    .find(|manifest| manifest.exists())
+}
+
+fn disabled_plugin_target(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.disabled", path.to_string_lossy()))
+}
+
+fn disabled_plugin_name(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let base = file_name.strip_suffix(".disabled").unwrap_or(&file_name);
+    Path::new(base)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| base.to_string())
 }
 
 fn toggle_plugin(ext: &Extension, enabled: bool, store: &Store, adapters: &[Box<dyn adapter::AgentAdapter>]) -> Result<(), HkError> {
@@ -381,7 +431,7 @@ fn toggle_plugin_manifest(
         let disabled_manifest = if let Some(p) = disabled_manifest {
             Some(p)
         } else {
-            find_disabled_manifest(adapter, &ext.id)
+            find_disabled_plugin_path(adapter, &ext.id)
         };
         if let Some(disabled) = disabled_manifest {
             let s = disabled.to_string_lossy();
@@ -404,33 +454,20 @@ fn toggle_plugin_manifest(
             if scanner::stable_id_for(&plugin_id_name, "plugin", adapter.name()) != ext.id {
                 continue;
             }
-            if let Some(ref path) = plugin.path {
-                for manifest_name in &[
-                    "plugin.json",
-                    ".cursor-plugin/plugin.json",
-                    ".codex-plugin/plugin.json",
-                    ".plugin/plugin.json",
-                    ".github/plugin/plugin.json",
-                ] {
-                    let manifest = path.join(manifest_name);
-                    if manifest.exists() {
-                        let disabled_manifest = PathBuf::from(format!(
-                            "{}.disabled",
-                            manifest.to_string_lossy()
-                        ));
-                        let saved = serde_json::json!({ "manifest_path": disabled_manifest.to_string_lossy() });
-                        store.set_disabled_config(&ext.id, Some(&saved.to_string()))?;
-                        std::fs::rename(&manifest, &disabled_manifest)?;
-                        found = true;
-                        break;
-                    }
-                }
+            if let Some(ref path) = plugin.path
+                && let Some(manifest) = plugin_toggle_target(path)
+            {
+                let disabled_manifest = disabled_plugin_target(&manifest);
+                let saved = serde_json::json!({ "manifest_path": disabled_manifest.to_string_lossy() });
+                store.set_disabled_config(&ext.id, Some(&saved.to_string()))?;
+                std::fs::rename(&manifest, &disabled_manifest)?;
+                found = true;
             }
             break;
         }
         if !found {
             return Err(HkError::NotFound(format!(
-                "No manifest found for plugin '{}' — cannot disable",
+                "No plugin file or manifest found for plugin '{}' — cannot disable",
                 ext.name
             )));
         }
@@ -440,11 +477,28 @@ fn toggle_plugin_manifest(
 
 /// Search plugin directories for a disabled manifest matching the given extension ID.
 /// Used as a fallback for plugins disabled before we started saving the manifest path.
-fn find_disabled_manifest(adapter: &dyn adapter::AgentAdapter, ext_id: &str) -> Option<PathBuf> {
+fn find_disabled_plugin_path(adapter: &dyn adapter::AgentAdapter, ext_id: &str) -> Option<PathBuf> {
     for plugin_dir in adapter.plugin_dirs() {
         if let Ok(entries) = std::fs::read_dir(&plugin_dir) {
             for entry in entries.flatten() {
-                if !entry.path().is_dir() {
+                if entry.path().is_file() {
+                    let path = entry.path();
+                    let file_name = path.file_name()?.to_string_lossy();
+                    if !file_name.ends_with(".disabled") {
+                        continue;
+                    }
+                    let source = if adapter.name() == "opencode" {
+                        "local".to_string()
+                    } else {
+                        plugin_dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    };
+                    let id_name = format!("{}:{}", disabled_plugin_name(&path), source);
+                    if scanner::stable_id_for(&id_name, "plugin", adapter.name()) == ext_id {
+                        return Some(path);
+                    }
                     continue;
                 }
                 // Check known manifest locations with .disabled suffix
@@ -1749,6 +1803,32 @@ mod tests {
         assert_eq!(redacted["env"]["API_KEY"], "<redacted>");
     }
 
+    #[test]
+    fn test_redact_mcp_env_handles_opencode_environment_key() {
+        // OpenCode's MCP schema names the env block "environment" (not "env").
+        // Without this support, secrets in OpenCode entries would be stored in
+        // plaintext in the SQLite DB on disable, and the restore-time warning
+        // about manually re-setting redacted values would never fire.
+        let entry = serde_json::json!({
+            "type": "local",
+            "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+            "environment": {
+                "PATH": "/opt/homebrew/bin:/usr/local/bin",
+                "GITHUB_TOKEN": "ghp_realsecret"
+            }
+        });
+        let redacted = super::redact_mcp_env(&entry);
+        assert_eq!(
+            redacted["environment"]["PATH"],
+            "/opt/homebrew/bin:/usr/local/bin",
+            "PATH must round-trip through redaction even under OpenCode's 'environment' key"
+        );
+        assert_eq!(redacted["environment"]["GITHUB_TOKEN"], "<redacted>");
+        // Schema-defining fields (type, command) untouched.
+        assert_eq!(redacted["type"], "local");
+        assert_eq!(redacted["command"][0], "npx");
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_copy_dir_contents_skips_symlinks_with_recheck() {
@@ -2130,6 +2210,34 @@ mod tests {
         // Disable should fail because there's no manifest to rename
         let r = toggle_extension_with_adapters(&store, &adapters, "ghost-1", false);
         assert!(r.is_err(), "disable with no manifest should fail");
+    }
+
+    #[test]
+    fn test_opencode_plugin_toggle_renames_file() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("test.db")).unwrap();
+        let plugins_dir = dir.path().join(".config/opencode/plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let plugin_path = plugins_dir.join("lint.ts");
+        std::fs::write(&plugin_path, "export default {};").unwrap();
+
+        let adapter = crate::adapter::opencode::OpencodeAdapter::with_home(dir.path().to_path_buf());
+        let adapters: Vec<Box<dyn adapter::AgentAdapter>> = vec![Box::new(adapter)];
+
+        let scanned = scanner::scan_plugins(&*adapters[0]);
+        assert_eq!(scanned.len(), 1);
+        store.sync_extensions(&scanned).unwrap();
+        let ext_id = scanned[0].id.clone();
+
+        let r = toggle_extension_with_adapters(&store, &adapters, &ext_id, false);
+        assert!(r.is_ok(), "disable failed: {:?}", r.err());
+        assert!(!plugin_path.exists());
+        assert!(plugins_dir.join("lint.ts.disabled").exists());
+
+        let r = toggle_extension_with_adapters(&store, &adapters, &ext_id, true);
+        assert!(r.is_ok(), "re-enable failed: {:?}", r.err());
+        assert!(plugin_path.exists());
+        assert!(!plugins_dir.join("lint.ts.disabled").exists());
     }
 
     /// Regression: a global skill and a project skill that happen to share a

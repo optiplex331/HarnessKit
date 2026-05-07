@@ -6,20 +6,20 @@ interface AgentCardProps {
   agent: AgentInfo;
 }
 
+const CLICK_DURATIONS: Partial<Record<AgentInfo["name"], number>> = {
+  claude: 4200,
+  windsurf: 1800,
+  opencode: 4000,
+  antigravity: 800,
+};
+
 export function AgentCard({ agent }: AgentCardProps) {
   const [isHovered, setIsHovered] = useState(false);
   const [isClicked, setIsClicked] = useState(false);
 
   const handleClick = useCallback(() => {
     setIsClicked(true);
-    const duration =
-      agent.name === "claude"
-        ? 4200
-        : agent.name === "windsurf"
-          ? 1800
-          : agent.name === "antigravity"
-            ? 800
-            : 600;
+    const duration = CLICK_DURATIONS[agent.name] ?? 600;
     setTimeout(() => setIsClicked(false), duration);
   }, [agent.name]);
 
@@ -28,7 +28,7 @@ export function AgentCard({ agent }: AgentCardProps) {
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       onClick={handleClick}
-      className={`group flex w-[110px] flex-col items-center gap-1.5 rounded-lg border border-border/60 bg-card/50 px-3 py-2.5 text-center transition-all duration-200 hover:border-border hover:bg-card hover:shadow-sm hover:-translate-y-0.5 ${agent.name === "codex" || agent.name === "antigravity" || agent.name === "claude" ? "overflow-hidden" : "overflow-visible"}`}
+      className={`group flex w-[110px] flex-col items-center gap-1.5 rounded-lg border border-border/60 bg-card/50 px-3 py-2.5 text-center transition-all duration-200 hover:border-border hover:bg-card hover:shadow-sm hover:-translate-y-0.5 ${agent.name === "codex" || agent.name === "antigravity" || agent.name === "claude" || agent.name === "opencode" ? "overflow-hidden" : "overflow-visible"}`}
     >
       <AgentMascot
         name={agent.name}
